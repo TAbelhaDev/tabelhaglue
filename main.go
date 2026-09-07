@@ -8,8 +8,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		printUsage()
-		os.Exit(1)
+		os.Exit(runTUI())
 	}
 
 	switch os.Args[1] {
@@ -48,7 +47,9 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Fprintln(os.Stderr, "uso: taglue <comando>")
+	fmt.Fprintln(os.Stderr, "uso: taglue [<comando>]")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "sem comando abre a TUI")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "comandos:")
 	fmt.Fprintln(os.Stderr, "  run <workflow>   executa um workflow")

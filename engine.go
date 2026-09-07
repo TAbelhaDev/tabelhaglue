@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -19,9 +20,24 @@ type stepOutput struct {
 	Parsed any
 }
 
-// engine runs a workflow's steps in sequence.
-func engine(w *Workflow) error {
+// runHooks lets a caller observe a workflow run as it happens (one step at a
+// time, one stderr line at a time) instead of only getting the final result.
+// engine's headless path and the TUI's run view both drive runWorkflow
+// through this; a nil field just means "don't care about that event".
+type runHooks struct {
+	StepStart func(i, n int, step Step)
+	StepLine  func(i int, line string)
+	StepDone  func(i int, out []byte)
+	StepError func(i int, err error)
+}
+
+// runWorkflow runs a workflow's steps in sequence, reporting progress through
+// h, and returns the last step's raw output. ctx bounds the whole run; each
+// step additionally gets its own 30s timeout derived from ctx, so cancelling
+// ctx (e.g. the TUI's esc) kills whichever step is currently in flight.
+func runWorkflow(ctx context.Context, w *Workflow, h runHooks) ([]byte, error) {
 	var outputs []stepOutput
+	var last []byte
 
 	for i, step := range w.Steps {
 		// Interpolate args from previous step outputs.
@@ -33,25 +49,82 @@ func engine(w *Workflow) error {
 			cmdArgs = append(cmdArgs, k+"="+v)
 		}
 
-		fmt.Fprintf(os.Stderr, "[%d/%d] %s %s\n", i+1, len(w.Steps), step.Tool, step.Method)
-
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		cmd := exec.CommandContext(ctx, step.Tool, cmdArgs...)
-		out, err := cmd.Output()
-		if err != nil {
-			return fmt.Errorf("step %d (%s %s): %w", i+1, step.Tool, step.Method, err)
+		if h.StepStart != nil {
+			h.StepStart(i+1, len(w.Steps), step)
 		}
 
+		stepCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+
+		cmd := exec.CommandContext(stepCtx, step.Tool, cmdArgs...)
+		var stdout bytes.Buffer
+		cmd.Stdout = &stdout
+
+		stderr, err := cmd.StderrPipe()
+		if err == nil {
+			err = cmd.Start()
+		}
+		if err != nil {
+			cancel()
+			if h.StepError != nil {
+				h.StepError(i+1, err)
+			}
+			return last, fmt.Errorf("step %d (%s %s): %w", i+1, step.Tool, step.Method, err)
+		}
+
+		// Drain stderr line-by-line before Wait — Wait requires every read
+		// from a pipe started via StderrPipe to have completed first.
+		linesDone := make(chan struct{})
+		go func() {
+			defer close(linesDone)
+			scanner := bufio.NewScanner(stderr)
+			for scanner.Scan() {
+				if h.StepLine != nil {
+					h.StepLine(i+1, scanner.Text())
+				}
+			}
+		}()
+		<-linesDone
+
+		err = cmd.Wait()
+		cancel()
+		if err != nil {
+			if h.StepError != nil {
+				h.StepError(i+1, err)
+			}
+			return last, fmt.Errorf("step %d (%s %s): %w", i+1, step.Tool, step.Method, err)
+		}
+
+		out := stdout.Bytes()
 		outputs = append(outputs, stepOutput{Raw: json.RawMessage(out)})
-		fmt.Fprintf(os.Stderr, "  ok (%d bytes)\n", len(out))
+		last = out
+		if h.StepDone != nil {
+			h.StepDone(i+1, out)
+		}
 	}
 
-	// Print the last step's output.
-	if len(outputs) > 0 {
+	return last, nil
+}
+
+// engine runs a workflow headlessly: progress goes to stderr, the last
+// step's pretty-printed JSON output goes to stdout — unchanged from before
+// runWorkflow existed. Tool stderr (taradar's "aviso: ..." lines etc.) is
+// still discarded on success, matching the old cmd.Output()-based behavior.
+func engine(w *Workflow) error {
+	last, err := runWorkflow(context.Background(), w, runHooks{
+		StepStart: func(i, n int, step Step) {
+			fmt.Fprintf(os.Stderr, "[%d/%d] %s %s\n", i, n, step.Tool, step.Method)
+		},
+		StepDone: func(i int, out []byte) {
+			fmt.Fprintf(os.Stderr, "  ok (%d bytes)\n", len(out))
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	if last != nil {
 		var pretty bytes.Buffer
-		json.Indent(&pretty, outputs[len(outputs)-1].Raw, "", "  ")
+		json.Indent(&pretty, last, "", "  ")
 		fmt.Println(pretty.String())
 	}
 

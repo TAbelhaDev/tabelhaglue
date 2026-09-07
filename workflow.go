@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 	"github.com/TAbelhaDev/tabelhatuiui"
@@ -51,4 +52,41 @@ func listWorkflows() ([]string, error) {
 		}
 	}
 	return names, nil
+}
+
+// workflowEntry is a workflow ready to show in the TUI's list: parsed enough
+// to display a name/description without the caller re-reading the TOML.
+type workflowEntry struct {
+	Name        string
+	Description string
+	Path        string
+}
+
+// listWorkflowEntries loads every workflow in the workflows directory. A
+// malformed TOML file is skipped rather than failing the whole list — one
+// broken workflow shouldn't blank out the TUI. A workflow with no `name` set
+// falls back to its filename (without the .toml extension).
+func listWorkflowEntries() ([]workflowEntry, error) {
+	dir := workflowsDir()
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var entries []workflowEntry
+	for _, f := range files {
+		if f.IsDir() || filepath.Ext(f.Name()) != ".toml" {
+			continue
+		}
+		path := filepath.Join(dir, f.Name())
+		w, err := loadWorkflow(path)
+		if err != nil {
+			continue
+		}
+		name := w.Name
+		if name == "" {
+			name = strings.TrimSuffix(f.Name(), ".toml")
+		}
+		entries = append(entries, workflowEntry{Name: name, Description: w.Description, Path: path})
+	}
+	return entries, nil
 }
