@@ -11,9 +11,27 @@ import (
 
 // Workflow is a declarative pipeline: a sequence of IPC calls to tools.
 type Workflow struct {
-	Name        string `toml:"name"`
-	Description string `toml:"description"`
-	Steps       []Step `toml:"steps"`
+	Name            string   `toml:"name"`
+	Description     string   `toml:"description"`
+	DescriptionFile string   `toml:"description_file"`
+	Metadata        Metadata `toml:"metadata"`
+	Schedule        Schedule `toml:"schedule"`
+	Steps           []Step   `toml:"steps"`
+}
+
+// Metadata records who installed a workflow and when — display-only, shown
+// in the TUI's metadata panel.
+type Metadata struct {
+	Creator     string `toml:"creator"`
+	InstalledAt string `toml:"installed_at"` // RFC3339
+}
+
+// Schedule holds the systemd OnCalendar expression for a workflow. Whether
+// the schedule is actually active is NOT stored here — it's derived from the
+// existence of ~/.config/systemd/user/taglue-<nome>.timer (see schedule.go),
+// the same convention jobs-tui uses to discover jobs.
+type Schedule struct {
+	OnCalendar string `toml:"on_calendar"`
 }
 
 // Step is one IPC call in a workflow.
@@ -60,6 +78,13 @@ type workflowEntry struct {
 	Name        string
 	Description string
 	Path        string
+	// File is the basename without ".toml" — the identity used by
+	// run/enable/disable (main.go resolves `taglue run <n>` as a filename,
+	// while Name comes from the TOML and can differ from it).
+	File string
+	// WF is the fully parsed workflow, kept around so the TUI's metadata and
+	// description panels don't need to re-read the TOML on every render.
+	WF *Workflow
 }
 
 // listWorkflowEntries loads every workflow in the workflows directory. A
@@ -82,11 +107,12 @@ func listWorkflowEntries() ([]workflowEntry, error) {
 		if err != nil {
 			continue
 		}
+		file := strings.TrimSuffix(f.Name(), ".toml")
 		name := w.Name
 		if name == "" {
-			name = strings.TrimSuffix(f.Name(), ".toml")
+			name = file
 		}
-		entries = append(entries, workflowEntry{Name: name, Description: w.Description, Path: path})
+		entries = append(entries, workflowEntry{Name: name, Description: w.Description, Path: path, File: file, WF: w})
 	}
 	return entries, nil
 }
