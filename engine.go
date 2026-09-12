@@ -14,6 +14,8 @@ import (
 	"time"
 )
 
+const defaultStepTimeout = 30 * time.Second
+
 // stepOutput holds the result of one step's IPC call.
 type stepOutput struct {
 	Raw    json.RawMessage
@@ -53,7 +55,11 @@ func runWorkflow(ctx context.Context, w *Workflow, h runHooks) ([]byte, error) {
 			h.StepStart(i+1, len(w.Steps), step)
 		}
 
-		stepCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		timeout := defaultStepTimeout
+		if step.TimeoutSeconds != nil && *step.TimeoutSeconds > 0 {
+			timeout = time.Duration(*step.TimeoutSeconds) * time.Second
+		}
+		stepCtx, cancel := context.WithTimeout(ctx, timeout)
 
 		cmd := exec.CommandContext(stepCtx, step.Tool, cmdArgs...)
 		var stdout bytes.Buffer

@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -14,6 +15,7 @@ type Workflow struct {
 	Name            string   `toml:"name"`
 	Description     string   `toml:"description"`
 	DescriptionFile string   `toml:"description_file"`
+	Group           string   `toml:"group"`
 	Metadata        Metadata `toml:"metadata"`
 	Schedule        Schedule `toml:"schedule"`
 	Steps           []Step   `toml:"steps"`
@@ -36,9 +38,10 @@ type Schedule struct {
 
 // Step is one IPC call in a workflow.
 type Step struct {
-	Tool   string            `toml:"tool"`
-	Method string            `toml:"method"`
-	Args   map[string]string `toml:"args"`
+	Tool           string            `toml:"tool"`
+	Method         string            `toml:"method"`
+	Args           map[string]string `toml:"args"`
+	TimeoutSeconds *int              `toml:"timeout_seconds"`
 }
 
 // loadWorkflow reads a workflow TOML file.
@@ -66,7 +69,7 @@ func listWorkflows() ([]string, error) {
 	var names []string
 	for _, e := range entries {
 		if !e.IsDir() && filepath.Ext(e.Name()) == ".toml" {
-			names = append(names, e.Name())
+			names = append(names, strings.TrimSuffix(e.Name(), ".toml"))
 		}
 	}
 	return names, nil
@@ -82,6 +85,9 @@ type workflowEntry struct {
 	// run/enable/disable (main.go resolves `taglue run <n>` as a filename,
 	// while Name comes from the TOML and can differ from it).
 	File string
+	// Group is the named project group this workflow belongs to
+	// (mirroring radar's [[groups]] config). Empty means ungrouped.
+	Group string
 	// WF is the fully parsed workflow, kept around so the TUI's metadata and
 	// description panels don't need to re-read the TOML on every render.
 	WF *Workflow
@@ -112,7 +118,24 @@ func listWorkflowEntries() ([]workflowEntry, error) {
 		if name == "" {
 			name = file
 		}
-		entries = append(entries, workflowEntry{Name: name, Description: w.Description, Path: path, File: file, WF: w})
+		entries = append(entries, workflowEntry{Name: name, Description: w.Description, Path: path, File: file, Group: w.Group, WF: w})
 	}
+	sort.Slice(entries, func(i, j int) bool {
+		gi, gj := entries[i].Group, entries[j].Group
+		// Empty group sorts last
+		if gi == "" && gj == "" {
+			return entries[i].Name < entries[j].Name
+		}
+		if gi == "" {
+			return false
+		}
+		if gj == "" {
+			return true
+		}
+		if gi != gj {
+			return gi < gj
+		}
+		return entries[i].Name < entries[j].Name
+	})
 	return entries, nil
 }

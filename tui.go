@@ -38,8 +38,8 @@ const (
 	minListWidth    = 20
 	minRightWidth   = 40
 	// metaFixedLines is the metadata panel's content budget: creator,
-	// installed_at, schedule status, on_calendar, blank, tools.
-	metaFixedLines = 6
+	// installed_at, group, schedule status, on_calendar, blank, tools.
+	metaFixedLines = 7
 )
 
 // panelFocus selects which of the two interactive panels — the workflow
@@ -336,11 +336,14 @@ func (m tuiModel) updateListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, resolve("quit")):
 		return m, tea.Quit
-	case key.Matches(msg, resolve("focus-list")):
-		m.focus = focusList
-		return m, nil
-	case key.Matches(msg, resolve("focus-desc")):
-		m.focus = focusDesc
+	case key.Matches(msg, resolve("nav")):
+		navKeys := resolve("nav").Keys()
+		switch {
+		case len(navKeys) > 0 && msg.String() == navKeys[0]:
+			m.focus = focusList
+		case len(navKeys) > 1 && msg.String() == navKeys[1]:
+			m.focus = focusDesc
+		}
 		return m, nil
 	case key.Matches(msg, resolve("run")):
 		if entry := m.current(); entry != nil {
@@ -586,7 +589,16 @@ func (m tuiModel) renderListPanel() string {
 		body = theme.Muted().Render("nenhum workflow em " + workflowsDir())
 	default:
 		lines := make([]string, 0, len(m.entries))
+		lastGroup := "\x01" // impossible value
 		for i, e := range m.entries {
+			g := e.Group
+			if g == "" {
+				g = "(sem grupo)"
+			}
+			if g != lastGroup {
+				lines = append(lines, theme.Muted().Render(g))
+				lastGroup = g
+			}
 			if i == m.cursor {
 				lines = append(lines, theme.Title().Render("▸ "+e.Name))
 			} else {
@@ -629,9 +641,14 @@ func (m tuiModel) renderMetaPanel() string {
 		if len(tools) == 0 {
 			toolsLine = "tools: -"
 		}
+		group := entry.Group
+		if group == "" {
+			group = "-"
+		}
 		body = strings.Join([]string{
 			"criador: " + creator,
 			"instalado em: " + installedAt,
+			"grupo: " + group,
 			scheduleStatus,
 			"on_calendar: " + onCalendar,
 			"",
@@ -705,7 +722,7 @@ func (m tuiModel) viewList() string {
 	if m.scheduleStatus != "" {
 		status = m.scheduleStatus
 	}
-	footer := tuiui.NewFooter(bindingsOf("focus-list", "focus-desc", "scroll", "run", "toggle-schedule", "help", "quit")...).
+	footer := tuiui.NewFooter(bindingsOf("nav", "scroll", "run", "toggle-schedule", "help", "quit")...).
 		Status(status).
 		Render(w, theme)
 

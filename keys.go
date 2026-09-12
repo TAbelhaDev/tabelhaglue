@@ -16,13 +16,13 @@ var reg = tuiui.NewKeyRegistry(filepath.Join(tuiui.ConfigDir(), "taglue", "keybi
 
 func init() {
 	reg.RegisterMany(
-		tuiui.Action{ID: "quit", Help: "sair", Keys: []string{"q", "ctrl+c"}},
+		tuiui.Action{ID: "quit", Help: "sair", Keys: []string{"q"}},
 		tuiui.Action{ID: "help", Help: "atalhos", Keys: []string{"?"}},
 		tuiui.Action{ID: "run", Help: "rodar", Keys: []string{"r", "enter"}, Label: "r/enter"},
 		tuiui.Action{ID: "back", Help: "voltar", Keys: []string{"esc"}},
 		tuiui.Action{ID: "scroll", Help: "navegar", Keys: []string{"j", "k", "up", "down"}, Label: "j/k"},
-		tuiui.Action{ID: "focus-list", Help: "lista", Keys: []string{"ctrl+h"}},
-		tuiui.Action{ID: "focus-desc", Help: "descrição", Keys: []string{"ctrl+l"}},
+		// Same "nav" convention as tabelharadar/tabelhajobs/tabelhanet.
+		tuiui.Action{ID: "nav", Help: "move focus", Keys: []string{"ctrl+h", "ctrl+l"}, Label: "ctrl+h/l"},
 		tuiui.Action{ID: "toggle-schedule", Help: "ativar/desativar agendamento", Keys: []string{"e"}},
 	)
 }
