@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.2.0 (2026-09-12)
+
+### Features
+- **Schedule Modal**: `e` key opens huh form for workflows without schedule (one-shot, daily, weekly, monthly, custom cycle, manual)
+- **Sidecar Schedules**: `~/.config/taglue/schedules.toml` stores structured schedules, preserving workflow TOML comments
+- **Script Generation**: oneshot/cycle workflows get wrapper scripts with self-cleanup/reschedule tails
+- **Schedule Package**: shared schedule component from tabelhatuiui v0.6.0
+
+### Fixes
+- Metadata panel shows human-readable schedule for structured schedules
+
 ## v0.1.0 (2026-09-11)
 
 ### Features

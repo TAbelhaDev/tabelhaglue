@@ -32,8 +32,21 @@ type Metadata struct {
 // the schedule is actually active is NOT stored here — it's derived from the
 // existence of ~/.config/systemd/user/taglue-<nome>.timer (see schedule.go),
 // the same convention jobs-tui uses to discover jobs.
+//
+// The structured fields (Kind, Hour, Minute, etc.) are used when the schedule
+// is created via the TUI modal. They're stored in a sidecar TOML file
+// (~/.config/taglue/schedules.toml) to avoid rewriting the user's workflow TOML.
 type Schedule struct {
-	OnCalendar string `toml:"on_calendar"`
+	OnCalendar string `toml:"on_calendar"` // raw escape hatch (existing)
+	// structured fields (from TOML or sidecar):
+	Kind       string   `toml:"kind"`         // oneshot|daily|weekly|monthly|cycle|manual
+	Hour       int      `toml:"hour"`
+	Minute     int      `toml:"minute"`
+	Weekdays   []string `toml:"weekdays"`     // ["Mon","Tue",...]
+	DayOfMonth int      `toml:"day_of_month"` // monthly
+	DOM        int      `toml:"dom"`          // oneshot/cycle first run day
+	Month      int      `toml:"month"`        // oneshot/cycle first run month
+	Cycle      []int    `toml:"cycle"`        // cycle day-intervals
 }
 
 // Step is one IPC call in a workflow.
@@ -44,12 +57,22 @@ type Step struct {
 	TimeoutSeconds *int              `toml:"timeout_seconds"`
 }
 
-// loadWorkflow reads a workflow TOML file.
+// loadWorkflow reads a workflow TOML file and merges any sidecar schedule.
 func loadWorkflow(path string) (*Workflow, error) {
 	var w Workflow
 	_, err := toml.DecodeFile(path, &w)
 	if err != nil {
 		return nil, err
+	}
+	// Merge sidecar if no raw on_calendar and no structured kind in TOML
+	if w.Schedule.OnCalendar == "" && w.Schedule.Kind == "" {
+		sidecar, err := loadSchedules()
+		if err == nil {
+			file := strings.TrimSuffix(filepath.Base(path), ".toml")
+			if s, ok := sidecar[file]; ok {
+				w.Schedule = s
+			}
+		}
 	}
 	return &w, nil
 }

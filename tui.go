@@ -7,13 +7,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/TAbelhaDev/tabelhatuiui"
+	"github.com/TAbelhaDev/tabelhatuiui/schedule"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
+	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -100,6 +104,10 @@ type tuiModel struct {
 	gen       int
 	done      bool
 	runErr    error
+
+	// schedule form state (huh)
+	scheduleForm  *huh.Form
+	scheduleEntry *workflowEntry
 }
 
 func newTUIModel() tuiModel {
@@ -302,6 +310,85 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Handle schedule form if active
+	if m.scheduleForm != nil {
+		if keyMsg, ok := msg.(tea.KeyMsg); ok && keyMsg.String() == "esc" {
+			// Cancel form
+			m.scheduleForm = nil
+			m.scheduleEntry = nil
+			m.scheduleStatus = ""
+			return m, nil
+		}
+		form, cmd := m.scheduleForm.Update(msg)
+		if f, ok := form.(*huh.Form); ok {
+			m.scheduleForm = f
+		}
+		if m.scheduleForm.State == huh.StateCompleted {
+			// Parse form results
+			entry := m.scheduleEntry
+			m.scheduleForm = nil
+			m.scheduleEntry = nil
+
+			kind, _ := m.scheduleForm.Get("type").(schedule.Kind)
+			if kind == schedule.KindManual {
+				// Manual: no-op, close form
+				m.scheduleStatus = ""
+				return m, nil
+			}
+
+			hour, minute, errTime := 0, 0, error(nil)
+			if kind != schedule.KindManual {
+				hour, minute, errTime = schedule.ParseHHMM(m.scheduleForm.GetString("time"))
+			}
+
+			sched := Schedule{Kind: kindName(kind), Hour: hour, Minute: minute}
+			valid := errTime == nil
+			switch kind {
+			case schedule.KindWeekly:
+				weekdays, _ := m.scheduleForm.Get("weekdays").([]time.Weekday)
+				for _, w := range weekdays {
+					sched.Weekdays = append(sched.Weekdays, weekdayStr(w))
+				}
+				valid = valid && len(weekdays) > 0
+			case schedule.KindMonthly:
+				dayOfMonth, errDOM := strconv.Atoi(strings.TrimSpace(m.scheduleForm.GetString("dayOfMonth")))
+				sched.DayOfMonth = dayOfMonth
+				valid = valid && errDOM == nil
+			case schedule.KindOneshot, schedule.KindCycle:
+				dom, month, errDate := schedule.ParseDDMM(m.scheduleForm.GetString("date"))
+				sched.DOM, sched.Month = dom, month
+				valid = valid && errDate == nil
+				if kind == schedule.KindCycle {
+					cycle, errCycle := schedule.ParseCycle(m.scheduleForm.GetString("cycle"))
+					sched.Cycle = cycle
+					valid = valid && errCycle == nil
+				}
+			}
+
+			if valid {
+				// Save to sidecar and enable
+				m.scheduling = true
+				m.scheduleStatus = "agendando..."
+				return m, func() tea.Msg {
+					if err := saveSchedule(entry.File, sched); err != nil {
+						return scheduleToggledMsg{name: entry.File, enabled: false, err: err}
+					}
+					// Reload workflow with sidecar merge
+					wf, err := loadWorkflow(entry.Path)
+					if err != nil {
+						return scheduleToggledMsg{name: entry.File, enabled: false, err: err}
+					}
+					entry.WF = wf
+					enabled, err := ToggleSchedule(entry.File, wf)
+					return scheduleToggledMsg{name: entry.File, enabled: enabled, err: err}
+				}
+			}
+			m.scheduleStatus = "horário inválido"
+			return m, nil
+		}
+		return m, cmd
+	}
+
 	if m.helpModal.Update(msg) {
 		return m, nil
 	}
@@ -351,13 +438,22 @@ func (m tuiModel) updateListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case key.Matches(msg, resolve("toggle-schedule")):
-		if m.scheduling {
+		if m.scheduling || m.scheduleForm != nil {
 			return m, nil
 		}
 		if entry := m.current(); entry != nil {
-			m.scheduling = true
-			m.scheduleStatus = "atualizando agendamento..."
-			return m, toggleScheduleCmd(*entry)
+			// Check if workflow has a schedule
+			hasSchedule := entry.WF.Schedule.OnCalendar != "" || entry.WF.Schedule.Kind != ""
+			if hasSchedule {
+				// Toggle directly
+				m.scheduling = true
+				m.scheduleStatus = "atualizando agendamento..."
+				return m, toggleScheduleCmd(*entry)
+			}
+			// No schedule: show the schedule form
+			m.scheduleEntry = entry
+			m.scheduleForm = huh.NewForm(schedule.Groups(schedule.Schedule{})...)
+			return m, m.scheduleForm.Init()
 		}
 		return m, nil
 	}
@@ -629,6 +725,9 @@ func (m tuiModel) renderMetaPanel() string {
 			installedAt = "-"
 		}
 		onCalendar := wf.Schedule.OnCalendar
+		if onCalendar == "" && wf.Schedule.Kind != "" {
+			onCalendar = scheduleString(wf.Schedule)
+		}
 		if onCalendar == "" {
 			onCalendar = "-"
 		}
@@ -762,6 +861,48 @@ func (m tuiModel) viewRun() string {
 		Render(w, theme)
 
 	return lipgloss.JoinVertical(lipgloss.Left, header, status, body, footer)
+}
+
+// kindName converts schedule.Kind to string for storage.
+func kindName(k schedule.Kind) string {
+	switch k {
+	case schedule.KindOneshot:
+		return "oneshot"
+	case schedule.KindDaily:
+		return "daily"
+	case schedule.KindWeekly:
+		return "weekly"
+	case schedule.KindMonthly:
+		return "monthly"
+	case schedule.KindCycle:
+		return "cycle"
+	case schedule.KindManual:
+		return "manual"
+	default:
+		return "daily"
+	}
+}
+
+// weekdayStr converts time.Weekday to string for storage.
+func weekdayStr(w time.Weekday) string {
+	switch w {
+	case time.Monday:
+		return "Mon"
+	case time.Tuesday:
+		return "Tue"
+	case time.Wednesday:
+		return "Wed"
+	case time.Thursday:
+		return "Thu"
+	case time.Friday:
+		return "Fri"
+	case time.Saturday:
+		return "Sat"
+	case time.Sunday:
+		return "Sun"
+	default:
+		return "Mon"
+	}
 }
 
 // runTUI opens the interactive Bubble Tea UI. Called when taglue is invoked
