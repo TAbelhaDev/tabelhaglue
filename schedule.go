@@ -25,8 +25,10 @@ func systemdUserDir() string {
 }
 
 // unitName is the systemd unit basename (without extension) for a workflow.
+// Following tajobs convention: units are named <workflow>.timer/.service
+// with no prefix, matching ~/jobs/<workflow>/ discovery.
 func unitName(name string) string {
-	return "taglue-" + name
+	return name
 }
 
 func timerPath(name string) string {
@@ -37,9 +39,14 @@ func servicePath(name string) string {
 	return filepath.Join(systemdUserDir(), unitName(name)+".service")
 }
 
+// jobsDir returns the tajobs-compatible job directory for a workflow.
+func jobsDir(name string) string {
+	return filepath.Join(tuiui.HomeDir(), "jobs", name)
+}
+
 // logPath is where the scheduled run's stdout/stderr is appended.
 func logPath(name string) string {
-	return filepath.Join(tuiui.HomeDir(), ".local", "state", "taglue", name+".log")
+	return filepath.Join(jobsDir(name), name+".log")
 }
 
 // IsScheduled reports whether a workflow currently has an active systemd
@@ -74,6 +81,8 @@ func validateCalendar(expr string) error {
 // units, and enables the timer — the single entry point used by both the CLI
 // (`taglue enable`) and the TUI's toggle-schedule key, per the task's
 // "ativar já cria todo o processo automaticamente" requirement.
+// It also creates ~/jobs/<name>/ with a wrapper script (tajobs layout)
+// and updates the metadata sidecar.
 func EnableWorkflow(name string, wf *Workflow) error {
 	// Determine the OnCalendar expression
 	var expr string
@@ -97,45 +106,44 @@ func EnableWorkflow(name string, wf *Workflow) error {
 		return fmt.Errorf("não foi possível localizar o binário taglue: %w", err)
 	}
 
-	log := logPath(name)
-	if err := os.MkdirAll(filepath.Dir(log), 0o755); err != nil {
-		return fmt.Errorf("erro criando dir de log: %w", err)
+	// Create the tajobs-compatible job directory
+	jobDir := jobsDir(name)
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		return fmt.Errorf("erro criando job dir: %w", err)
 	}
+
 	if err := os.MkdirAll(systemdUserDir(), 0o755); err != nil {
 		return fmt.Errorf("erro criando dir de units systemd: %w", err)
 	}
 
-	// Determine ExecStart based on kind
-	var execStart string
+	// Remove legacy taglue-<name> units if they exist from the old layout
+	removeLegacyUnits(name)
+
+	// Write wrapper script for all kinds (tajobs expects ~/jobs/<name>/<name>.sh)
+	var script string
 	switch sched.Kind {
 	case schedule.KindOneshot:
-		// Generate wrapper script with cleanup tail
-		script := fmt.Sprintf("#!/usr/bin/env bash\nset -euo pipefail\n\nJOB_NAME=%q\n\n%s run %s\n%s",
+		script = fmt.Sprintf("#!/usr/bin/env bash\nset -euo pipefail\n\nJOB_NAME=%q\n\n%s run %s\n%s",
 			name, bin, name, schedule.OneshotCleanupTail(timerPath(name), servicePath(name)))
-		if err := os.WriteFile(scriptPath(name), []byte(script), 0o755); err != nil {
-			return fmt.Errorf("erro escrevendo wrapper script: %w", err)
-		}
-		execStart = scriptPath(name)
 	case schedule.KindCycle:
-		// Generate wrapper script with cycle reschedule tail
-		// Write recur file
 		cycleFields := make([]string, len(sched.Cycle))
 		for i, d := range sched.Cycle {
 			cycleFields[i] = strconv.Itoa(d)
 		}
-		if err := os.WriteFile(recurPath(name), []byte(strings.Join(cycleFields, " ")+"\n0\n"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(jobDir, name+".recur"), []byte(strings.Join(cycleFields, " ")+"\n0\n"), 0o644); err != nil {
 			return fmt.Errorf("erro escrevendo recur file: %w", err)
 		}
-		script := fmt.Sprintf("#!/usr/bin/env bash\nset -euo pipefail\n\nJOB_NAME=%q\n\n%s run %s\n%s",
-			name, bin, name, schedule.CycleRescheduleTail(recurPath(name), timerPath(name), unitName(name)+".timer"))
-		if err := os.WriteFile(scriptPath(name), []byte(script), 0o755); err != nil {
-			return fmt.Errorf("erro escrevendo wrapper script: %w", err)
-		}
-		execStart = scriptPath(name)
+		script = fmt.Sprintf("#!/usr/bin/env bash\nset -euo pipefail\n\nJOB_NAME=%q\n\n%s run %s\n%s",
+			name, bin, name, schedule.CycleRescheduleTail(recurPath(name), timerPath(name), name+".timer"))
 	default:
-		// daily/weekly/monthly: direct taglue run
-		execStart = fmt.Sprintf("%s run %s", bin, name)
+		// daily/weekly/monthly: simple wrapper
+		script = fmt.Sprintf("#!/usr/bin/env bash\nset -euo pipefail\n\nJOB_NAME=%q\n\n%s run %s\n", name, bin, name)
 	}
+	if err := os.WriteFile(scriptPath(name), []byte(script), 0o755); err != nil {
+		return fmt.Errorf("erro escrevendo wrapper script: %w", err)
+	}
+
+	execStart := scriptPath(name)
 
 	service := fmt.Sprintf(`[Unit]
 Description=taglue %s (workflow agendado)
@@ -146,7 +154,7 @@ TimeoutStartSec=infinity
 ExecStart=%s
 StandardOutput=append:%s
 StandardError=append:%s
-`, name, execStart, log, log)
+`, name, execStart, logPath(name), logPath(name))
 
 	timer := fmt.Sprintf(`[Unit]
 Description=taglue %s (schedule)
@@ -169,16 +177,32 @@ WantedBy=timers.target
 	if out, err := exec.Command("systemctl", "--user", "daemon-reload").CombinedOutput(); err != nil {
 		return fmt.Errorf("erro em daemon-reload: %s", string(out))
 	}
-	if out, err := exec.Command("systemctl", "--user", "enable", "--now", unitName(name)+".timer").CombinedOutput(); err != nil {
+	if out, err := exec.Command("systemctl", "--user", "enable", "--now", name+".timer").CombinedOutput(); err != nil {
 		return fmt.Errorf("erro habilitando timer: %s", string(out))
 	}
+
+	// Auto-update metadata (installed_at on first enable, updated_at always)
+	touchMetadata(name)
+
 	return nil
 }
 
+// removeLegacyUnits removes old taglue-<name> units from the pre-tajobs layout.
+func removeLegacyUnits(name string) {
+	prefix := "taglue-" + name
+	timer := filepath.Join(systemdUserDir(), prefix+".timer")
+	service := filepath.Join(systemdUserDir(), prefix+".service")
+
+	_ = exec.Command("systemctl", "--user", "disable", "--now", prefix+".timer").Run()
+	os.Remove(timer)
+	os.Remove(service)
+}
+
 // DisableWorkflow stops and removes a workflow's systemd units, plus any
-// wrapper scripts or recur files for oneshot/cycle workflows.
+// wrapper scripts or recur files. The ~/jobs/<name>/ dir and log are kept
+// for tajobs history (shows as "done" after disable).
 func DisableWorkflow(name string) error {
-	_ = exec.Command("systemctl", "--user", "disable", "--now", unitName(name)+".timer").Run()
+	_ = exec.Command("systemctl", "--user", "disable", "--now", name+".timer").Run()
 
 	if err := os.Remove(timerPath(name)); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("erro removendo timer unit: %w", err)
@@ -188,7 +212,7 @@ func DisableWorkflow(name string) error {
 	}
 	// Remove wrapper script and recur file if they exist
 	os.Remove(scriptPath(name))
-	os.Remove(recurPath(name))
+	os.Remove(filepath.Join(jobsDir(name), name+".recur"))
 
 	if out, err := exec.Command("systemctl", "--user", "daemon-reload").CombinedOutput(); err != nil {
 		return fmt.Errorf("erro em daemon-reload: %s", string(out))
@@ -234,6 +258,7 @@ func loadSchedules() (map[string]Schedule, error) {
 
 // saveSchedule writes a single workflow's schedule to the sidecar, preserving
 // other entries. It reads the existing file, updates the entry, and rewrites.
+// Also touches metadata to keep updated_at current.
 func saveSchedule(name string, s Schedule) error {
 	path := sidecarPath()
 	m := make(map[string]Schedule)
@@ -248,7 +273,14 @@ func saveSchedule(name string, s Schedule) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("erro criando dir do sidecar: %w", err)
 	}
-	return writeSidecar(path, m)
+	if err := writeSidecar(path, m); err != nil {
+		return err
+	}
+
+	// Auto-update metadata timestamps on schedule change
+	touchMetadata(name)
+
+	return nil
 }
 
 // removeSchedule deletes a workflow's entry from the sidecar.
@@ -262,6 +294,77 @@ func removeSchedule(name string) error {
 	}
 	delete(m, name)
 	return writeSidecar(path, m)
+}
+
+// Metadata sidecar: ~/.config/taglue/metadata.toml
+// Stores installed_at/updated_at per workflow, auto-maintained on schedule
+// changes. Sidecar overrides TOML [metadata] for these fields.
+
+func metadataSidecarPath() string {
+	return filepath.Join(tuiui.ConfigDir(), "taglue", "metadata.toml")
+}
+
+// loadMetadata reads the metadata sidecar into a map keyed by workflow filename.
+func loadMetadata() (map[string]Metadata, error) {
+	path := metadataSidecarPath()
+	m := make(map[string]Metadata)
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return m, nil
+	}
+	if _, err := toml.DecodeFile(path, &m); err != nil {
+		return nil, fmt.Errorf("erro lendo sidecar de metadata: %w", err)
+	}
+	return m, nil
+}
+
+// saveMetadata writes a single workflow's metadata to the sidecar, preserving
+// other entries. It reads the existing file, updates the entry, and rewrites.
+func saveMetadata(name string, md Metadata) error {
+	path := metadataSidecarPath()
+	m := make(map[string]Metadata)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		if _, err := toml.DecodeFile(path, &m); err != nil {
+			return fmt.Errorf("erro lendo sidecar de metadata: %w", err)
+		}
+	}
+	m[name] = md
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("erro criando dir do sidecar: %w", err)
+	}
+
+	var b strings.Builder
+	for key, md := range m {
+		fmt.Fprintf(&b, "[%s]\n", key)
+		if md.Creator != "" {
+			fmt.Fprintf(&b, "creator = %q\n", md.Creator)
+		}
+		if md.InstalledAt != "" {
+			fmt.Fprintf(&b, "installed_at = %q\n", md.InstalledAt)
+		}
+		if md.UpdatedAt != "" {
+			fmt.Fprintf(&b, "updated_at = %q\n", md.UpdatedAt)
+		}
+		b.WriteString("\n")
+	}
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+// touchMetadata sets installed_at (if empty) and updated_at = now for a
+// workflow. Called on schedule changes and enable to keep metadata current.
+func touchMetadata(name string) {
+	meta, err := loadMetadata()
+	if err != nil {
+		return
+	}
+	m := meta[name]
+	now := time.Now().Format(time.RFC3339)
+	if m.InstalledAt == "" {
+		m.InstalledAt = now
+	}
+	m.UpdatedAt = now
+	_ = saveMetadata(name, m)
 }
 
 func writeSidecar(path string, m map[string]Schedule) error {
@@ -362,19 +465,42 @@ func scheduleToSchedule(s Schedule) schedule.Schedule {
 }
 
 // scheduleString returns a human-readable summary for the metadata panel.
+// When Kind is set, always prefer the structured representation (e.g.
+// "diário 21:00") over the raw OnCalendar expression for consistent
+// display across workflows.
 func scheduleString(s Schedule) string {
+	if s.Kind != "" {
+		return scheduleToSchedule(s).String()
+	}
 	if s.OnCalendar != "" {
 		return s.OnCalendar
 	}
 	return scheduleToSchedule(s).String()
 }
 
-// scriptPath is the wrapper script for oneshot/cycle workflows.
-func scriptPath(name string) string {
-	return filepath.Join(tuiui.HomeDir(), ".local", "state", "taglue", name+".sh")
+// preFillSchedule builds a schedule.Schedule from a workflow's current config
+// so the huh form opens with the existing values already selected. If the
+// workflow only has a raw on_calendar (no structured kind), it defaults to
+// KindManual since raw cron can't be mapped to the form's fields.
+func preFillSchedule(wf *Workflow) schedule.Schedule {
+	if wf == nil {
+		return schedule.Schedule{}
+	}
+	s := wf.Schedule
+	// If there's only a raw on_calendar and no structured kind, default
+	// to manual — the form can't represent raw cron expressions.
+	if s.Kind == "" && s.OnCalendar != "" {
+		return schedule.Schedule{Kind: schedule.KindManual}
+	}
+	return scheduleToSchedule(s)
 }
 
-// recurPath is the cycle state file.
+// scriptPath is the wrapper script in the tajobs job directory.
+func scriptPath(name string) string {
+	return filepath.Join(jobsDir(name), name+".sh")
+}
+
+// recurPath is the cycle state file in the tajobs job directory.
 func recurPath(name string) string {
-	return filepath.Join(tuiui.HomeDir(), ".local", "state", "taglue", name+".recur")
+	return filepath.Join(jobsDir(name), name+".recur")
 }

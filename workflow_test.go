@@ -124,9 +124,10 @@ func TestInterpolate_MissingField(t *testing.T) {
 		{Raw: json.RawMessage(`{"name": "test"}`)},
 	}
 	got := interpolate("${steps.0.output.missing}", outputs)
-	// extractField returns "<nil>" for missing keys (fmt.Sprintf("%v", nil))
-	if got != "<nil>" {
-		t.Errorf("interpolate = %q, want %q", got, "<nil>")
+	// Missing field in object → raw JSON fallback (README:111).
+	want := `{"name": "test"}`
+	if got != want {
+		t.Errorf("interpolate = %q, want %q", got, want)
 	}
 }
 

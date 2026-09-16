@@ -8,7 +8,7 @@ import (
 
 func TestUnitName(t *testing.T) {
 	got := unitName("project-selfdoc")
-	want := "taglue-project-selfdoc"
+	want := "project-selfdoc"
 	if got != want {
 		t.Errorf("unitName = %q, want %q", got, want)
 	}
@@ -22,8 +22,8 @@ func TestTimerPath(t *testing.T) {
 	if filepath.Ext(got) != ".timer" {
 		t.Errorf("timerPath ext = %q, want .timer", got)
 	}
-	if filepath.Base(got) != "taglue-project-selfdoc.timer" {
-		t.Errorf("timerPath base = %q", filepath.Base(got))
+	if filepath.Base(got) != "project-selfdoc.timer" {
+		t.Errorf("timerPath base = %q, want project-selfdoc.timer", filepath.Base(got))
 	}
 }
 
@@ -34,6 +34,16 @@ func TestServicePath(t *testing.T) {
 	}
 }
 
+func TestJobsDir(t *testing.T) {
+	got := jobsDir("project-selfdoc")
+	if !filepath.IsAbs(got) {
+		t.Errorf("jobsDir is not absolute: %q", got)
+	}
+	if filepath.Base(got) != "project-selfdoc" {
+		t.Errorf("jobsDir base = %q, want project-selfdoc", filepath.Base(got))
+	}
+}
+
 func TestLogPath(t *testing.T) {
 	got := logPath("project-selfdoc")
 	if !filepath.IsAbs(got) {
@@ -41,6 +51,23 @@ func TestLogPath(t *testing.T) {
 	}
 	if filepath.Ext(got) != ".log" {
 		t.Errorf("logPath ext = %q, want .log", got)
+	}
+	// Log should be inside ~/jobs/<name>/
+	if filepath.Dir(got) != filepath.Dir(filepath.Join(jobsDir("project-selfdoc"), "project-selfdoc.log")) {
+		t.Errorf("logPath dir = %q, want jobs dir", filepath.Dir(got))
+	}
+}
+
+func TestScriptPath(t *testing.T) {
+	got := scriptPath("project-selfdoc")
+	if !filepath.IsAbs(got) {
+		t.Errorf("scriptPath is not absolute: %q", got)
+	}
+	if filepath.Ext(got) != ".sh" {
+		t.Errorf("scriptPath ext = %q, want .sh", got)
+	}
+	if filepath.Dir(got) != jobsDir("project-selfdoc") {
+		t.Errorf("scriptPath dir = %q, want jobsDir", filepath.Dir(got))
 	}
 }
 
@@ -56,8 +83,8 @@ func TestIsScheduled_NoUnits(t *testing.T) {
 
 func TestIsScheduled_WithUnits(t *testing.T) {
 	// Create a temp timer file in the real systemd dir (risky but fast)
-	// Instead, we'll test the function logic indirectly
-	// by checking that the path convention is correct
+	// IsScheduled uses the real systemd path, so we just test that
+	// the path convention is correct
 	timer := timerPath("test-roundtrip")
 	service := servicePath("test-roundtrip")
 

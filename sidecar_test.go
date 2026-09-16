@@ -120,8 +120,11 @@ func TestScheduleString(t *testing.T) {
 		input Schedule
 		want  string
 	}{
+		// Raw OnCalendar only (no Kind): show raw
 		{Schedule{OnCalendar: "*-*-* 21:00:00"}, "*-*-* 21:00:00"},
+		// Structured Kind: always prefer structured, even with raw OnCalendar present
 		{Schedule{Kind: "daily", Hour: 21, Minute: 0}, "diário 21:00"},
+		{Schedule{OnCalendar: "*-*-* 21:00:00", Kind: "daily", Hour: 21, Minute: 0}, "diário 21:00"},
 		{Schedule{Kind: "manual"}, "manual"},
 	}
 	for _, tt := range tests {

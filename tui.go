@@ -12,11 +12,11 @@ import (
 	"time"
 
 	"github.com/TAbelhaDev/tabelhatuiui"
+	"github.com/TAbelhaDev/tabelhatuiui/markdown"
 	"github.com/TAbelhaDev/tabelhatuiui/schedule"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -79,18 +79,23 @@ type tuiModel struct {
 	metaLines       int
 	descMaxLines    int
 
-	// descScroll is the first visible line of the selected workflow's
-	// rendered description; descCache* avoids re-running glamour on every
-	// keystroke (it's only invalidated by a cursor move or a resize).
-	descScroll     int
-	descCachePath  string
-	descCacheWidth int
-	descCacheLines []string
+	// listScroll is the first visible line index in the list panel.
+	listScroll int
+
+	// descVP is the scrollable description panel, using the shared
+	// markdown.Render + Viewport from tabelhatuiui.
+	descVP *markdown.Panel
 
 	scheduling     bool
 	scheduleStatus string
 
-	helpModal *tuiui.HelpModal
+	helpModal     *tuiui.HelpModal
+	settingsModal *tuiui.SettingsModal
+
+	// notice is a transient status message that auto-clears after a timeout
+	// (the kanban "renderNotice" pattern).
+	noticeMsg     string
+	noticeClearAt time.Time
 
 	// run state
 	wf        *Workflow
@@ -116,10 +121,12 @@ func newTUIModel() tuiModel {
 	return tuiModel{
 		entries: entries,
 		listErr: err,
+		descVP:  markdown.NewPanel(),
 		helpModal: tuiui.NewHelpModal(tuiui.HelpSection{
 			Title:      "Atalhos",
 			BindingsFn: reg.Bindings,
 		}),
+		settingsModal: tuiui.NewSettingsModal(reg),
 	}
 }
 
@@ -159,6 +166,16 @@ type scheduleToggledMsg struct {
 	name    string
 	enabled bool
 	err     error
+}
+
+// noticeClearedMsg is sent by the tea.Tick timeout to dismiss the transient
+// status message — same pattern as kanban's renderNotice/clearNoticeMsg.
+type noticeClearedMsg struct{}
+
+func clearNoticeCmd() tea.Cmd {
+	return tea.Tick(4*time.Second, func(_ time.Time) tea.Msg {
+		return noticeClearedMsg{}
+	})
 }
 
 // sendMsg delivers msg to ch, unless ctx is already cancelled — the
@@ -245,15 +262,61 @@ func (m tuiModel) startRun(entry workflowEntry) (tea.Model, tea.Cmd) {
 	return m, waitForRunMsg(ch)
 }
 
-func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m tuiModel) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "panic na TUI: %v\n", r)
+			model = m
+			cmd = tea.Quit
+		}
+	}()
+
+	// Notice timeout: clear the transient message if still on the same gen.
+	switch msg.(type) {
+	case noticeClearedMsg:
+		m.noticeMsg = ""
+		return m, nil
+	}
+
+	// Schedule toggled: update the cached Scheduled field on the entry.
+	switch msg := msg.(type) {
+	case scheduleToggledMsg:
+		m.scheduling = false
+		switch {
+		case msg.err != nil:
+			m.noticeMsg = "erro: " + msg.err.Error()
+			m.noticeClearAt = time.Now().Add(8 * time.Second)
+		case msg.enabled:
+			m.noticeMsg = fmt.Sprintf("%q agendado", msg.name)
+			m.noticeClearAt = time.Now().Add(4 * time.Second)
+			for i := range m.entries {
+				if m.entries[i].File == msg.name {
+					m.entries[i].Scheduled = true
+					break
+				}
+			}
+		default:
+			m.noticeMsg = fmt.Sprintf("%q agendamento removido", msg.name)
+			m.noticeClearAt = time.Now().Add(4 * time.Second)
+			for i := range m.entries {
+				if m.entries[i].File == msg.name {
+					m.entries[i].Scheduled = false
+					break
+				}
+			}
+		}
+		m.scheduleStatus = ""
+		return m, clearNoticeCmd()
+	}
+
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
 		m.helpModal.SetSize(msg.Width, msg.Height)
+		m.settingsModal.SetSize(msg.Width, msg.Height)
 		m.resizeViewport()
 		m.layout()
-		m.refreshDescCache()
 		return m, nil
 
 	case stepStartMsg:
@@ -296,84 +359,104 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
-
-	case scheduleToggledMsg:
-		m.scheduling = false
-		switch {
-		case msg.err != nil:
-			m.scheduleStatus = "erro: " + msg.err.Error()
-		case msg.enabled:
-			m.scheduleStatus = fmt.Sprintf("%q agendado", msg.name)
-		default:
-			m.scheduleStatus = fmt.Sprintf("%q agendamento removido", msg.name)
-		}
-		return m, nil
 	}
 
 	// Handle schedule form if active
 	if m.scheduleForm != nil {
 		if keyMsg, ok := msg.(tea.KeyMsg); ok && keyMsg.String() == "esc" {
-			// Cancel form
 			m.scheduleForm = nil
 			m.scheduleEntry = nil
 			m.scheduleStatus = ""
 			return m, nil
 		}
-		form, cmd := m.scheduleForm.Update(msg)
-		if f, ok := form.(*huh.Form); ok {
-			m.scheduleForm = f
+
+		// Protect against huh panics — if the form's internal state
+		// machine misbehaves, kill the form instead of the whole TUI.
+		var form tea.Model
+		var cmd tea.Cmd
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "panic no form de agendamento: %v\n", r)
+					m.scheduleForm = nil
+					m.scheduleEntry = nil
+					m.noticeMsg = fmt.Sprintf("erro no form: %v", r)
+					m.noticeClearAt = time.Now().Add(8 * time.Second)
+					form = nil
+					cmd = nil
+				}
+			}()
+			form, cmd = m.scheduleForm.Update(msg)
+		}()
+
+		if form != nil {
+			if f, ok := form.(*huh.Form); ok {
+				m.scheduleForm = f
+			}
 		}
+
+		if m.scheduleForm == nil {
+			return m, cmd
+		}
+
 		if m.scheduleForm.State == huh.StateCompleted {
-			// Parse form results
 			entry := m.scheduleEntry
+			form := m.scheduleForm
 			m.scheduleForm = nil
 			m.scheduleEntry = nil
 
-			kind, _ := m.scheduleForm.Get("type").(schedule.Kind)
+			kind, _ := form.Get("type").(schedule.Kind)
 			if kind == schedule.KindManual {
-				// Manual: no-op, close form
-				m.scheduleStatus = ""
-				return m, nil
+				// Disable any existing schedule and remove sidecar
+				m.scheduling = true
+				m.scheduleStatus = "removendo agendamento..."
+				return m, func() tea.Msg {
+					_ = removeSchedule(entry.File)
+					if IsScheduled(entry.File) {
+						if err := DisableWorkflow(entry.File); err != nil {
+							return scheduleToggledMsg{name: entry.File, enabled: false, err: err}
+						}
+					}
+					return scheduleToggledMsg{name: entry.File, enabled: false, err: nil}
+				}
 			}
 
 			hour, minute, errTime := 0, 0, error(nil)
 			if kind != schedule.KindManual {
-				hour, minute, errTime = schedule.ParseHHMM(m.scheduleForm.GetString("time"))
+				hour, minute, errTime = schedule.ParseHHMM(form.GetString("time"))
 			}
 
 			sched := Schedule{Kind: kindName(kind), Hour: hour, Minute: minute}
 			valid := errTime == nil
 			switch kind {
 			case schedule.KindWeekly:
-				weekdays, _ := m.scheduleForm.Get("weekdays").([]time.Weekday)
+				weekdays, _ := form.Get("weekdays").([]time.Weekday)
 				for _, w := range weekdays {
 					sched.Weekdays = append(sched.Weekdays, weekdayStr(w))
 				}
 				valid = valid && len(weekdays) > 0
 			case schedule.KindMonthly:
-				dayOfMonth, errDOM := strconv.Atoi(strings.TrimSpace(m.scheduleForm.GetString("dayOfMonth")))
+				dayOfMonth, errDOM := strconv.Atoi(strings.TrimSpace(form.GetString("dayOfMonth")))
 				sched.DayOfMonth = dayOfMonth
 				valid = valid && errDOM == nil
 			case schedule.KindOneshot, schedule.KindCycle:
-				dom, month, errDate := schedule.ParseDDMM(m.scheduleForm.GetString("date"))
+				dom, month, errDate := schedule.ParseDDMM(form.GetString("date"))
 				sched.DOM, sched.Month = dom, month
 				valid = valid && errDate == nil
 				if kind == schedule.KindCycle {
-					cycle, errCycle := schedule.ParseCycle(m.scheduleForm.GetString("cycle"))
+					cycle, errCycle := schedule.ParseCycle(form.GetString("cycle"))
 					sched.Cycle = cycle
 					valid = valid && errCycle == nil
 				}
 			}
 
 			if valid {
-				// Save to sidecar and enable
 				m.scheduling = true
 				m.scheduleStatus = "agendando..."
 				return m, func() tea.Msg {
 					if err := saveSchedule(entry.File, sched); err != nil {
 						return scheduleToggledMsg{name: entry.File, enabled: false, err: err}
 					}
-					// Reload workflow with sidecar merge
 					wf, err := loadWorkflow(entry.Path)
 					if err != nil {
 						return scheduleToggledMsg{name: entry.File, enabled: false, err: err}
@@ -389,6 +472,11 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	// Settings modal: consume all input while visible.
+	if m.settingsModal.Update(msg) {
+		return m, nil
+	}
+
 	if m.helpModal.Update(msg) {
 		return m, nil
 	}
@@ -396,6 +484,10 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
 		if key.Matches(keyMsg, resolve("help")) {
 			m.helpModal.Toggle()
+			return m, nil
+		}
+		if key.Matches(keyMsg, resolve("settings")) {
+			m.settingsModal.Toggle()
 			return m, nil
 		}
 		if m.mode == modeRun {
@@ -423,6 +515,13 @@ func (m tuiModel) updateListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, resolve("quit")):
 		return m, tea.Quit
+	case key.Matches(msg, resolve("refresh")):
+		entries, err := listWorkflowEntries()
+		m.entries = entries
+		m.listErr = err
+		m.descVP.Viewport().Reset()
+		m.reclampList()
+		return m, nil
 	case key.Matches(msg, resolve("nav")):
 		navKeys := resolve("nav").Keys()
 		switch {
@@ -442,32 +541,19 @@ func (m tuiModel) updateListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if entry := m.current(); entry != nil {
-			// Check if workflow has a schedule
-			hasSchedule := entry.WF.Schedule.OnCalendar != "" || entry.WF.Schedule.Kind != ""
-			if hasSchedule {
-				// Toggle directly
-				m.scheduling = true
-				m.scheduleStatus = "atualizando agendamento..."
-				return m, toggleScheduleCmd(*entry)
-			}
-			// No schedule: show the schedule form
 			m.scheduleEntry = entry
-			m.scheduleForm = huh.NewForm(schedule.Groups(schedule.Schedule{})...)
+			// Pre-fill the form with the current schedule if one exists
+			// (from sidecar or on_calendar). This way the user always
+			// sees the form and can modify/disable the schedule.
+			m.scheduleForm = huh.NewForm(schedule.Groups(preFillSchedule(entry.WF))...)
 			return m, m.scheduleForm.Init()
 		}
 		return m, nil
 	}
 
 	if m.focus == focusDesc {
-		switch msg.String() {
-		case "j", "down":
-			if m.descScroll < m.maxDescScroll() {
-				m.descScroll++
-			}
-		case "k", "up":
-			if m.descScroll > 0 {
-				m.descScroll--
-			}
+		if m.descVP.Viewport().Update(msg) {
+			return m, nil
 		}
 		return m, nil
 	}
@@ -476,14 +562,14 @@ func (m tuiModel) updateListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "j", "down":
 		if m.cursor < len(m.entries)-1 {
 			m.cursor++
-			m.descScroll = 0
-			m.refreshDescCache()
+			m.descVP.Viewport().Reset()
+			m.reclampList()
 		}
 	case "k", "up":
 		if m.cursor > 0 {
 			m.cursor--
-			m.descScroll = 0
-			m.refreshDescCache()
+			m.descVP.Viewport().Reset()
+			m.reclampList()
 		}
 	}
 	return m, nil
@@ -528,8 +614,7 @@ func (m *tuiModel) resizeViewport() {
 // layout recomputes the list/metadata/description panel widths and heights
 // so the whole 3-panel view always fits exactly within m.height — mirrors
 // tabelharadar/model.go's layout(): fixed line budgets per panel instead of
-// letting lipgloss stretch content past what fits, which is exactly the bug
-// radar hit and fixed once already.
+// letting lipgloss stretch content past what fits.
 func (m *tuiModel) layout() {
 	if m.width == 0 || m.height == 0 {
 		return
@@ -560,7 +645,15 @@ func (m *tuiModel) layout() {
 		bodyHeight = minBody
 	}
 
-	metaBoxHeight := metaBoxOverhead + metaFixedLines
+	// Dynamic meta sizing: use the selected workflow's actual content
+	// length, clamped between minMetaLines and (bodyHeight - minDescLines).
+	// This gives short descriptions more room and long tools lists space.
+	metaContentLines := metaFixedLines // default fallback
+	entry := m.current()
+	if entry != nil {
+		metaContentLines = len(computeMetaContent(entry))
+	}
+	metaBoxHeight := metaBoxOverhead + metaContentLines
 	if maxMeta := bodyHeight - (descBoxOverhead + minDescLines); metaBoxHeight > maxMeta {
 		metaBoxHeight = maxMeta
 	}
@@ -574,6 +667,7 @@ func (m *tuiModel) layout() {
 
 	m.metaLines = metaBoxHeight - metaBoxOverhead
 	m.descMaxLines = descBoxHeight - descBoxOverhead
+	m.descVP.Viewport().SetHeight(m.descMaxLines)
 
 	// The list panel spans both right-column boxes stacked together, so its
 	// row budget must match their combined (post-clamp) height exactly or
@@ -584,62 +678,41 @@ func (m *tuiModel) layout() {
 	}
 }
 
-// maxDescScroll is the highest descScroll that still leaves the last line
-// visible — scrolling past it would just show trailing blank space.
-func (m tuiModel) maxDescScroll() int {
-	if n := len(m.descCacheLines) - m.descMaxLines; n > 0 {
+// maxListScroll is the highest listScroll that still leaves the last line
+// visible. The number of rendered lines includes both workflow entries and
+// group header lines.
+func (m tuiModel) maxListScroll() int {
+	if n := m.listRenderedLines() - m.listRowsHeight; n > 0 {
 		return n
 	}
 	return 0
 }
 
-// refreshDescCache re-renders the selected workflow's description (via
-// glamour, or a plain-text fallback) only when the selection or the panel
-// width actually changed — re-running glamour on every keystroke would be
-// wasteful, and WithWordWrap is fixed at renderer construction anyway.
-func (m *tuiModel) refreshDescCache() {
-	entry := m.current()
-	if entry == nil {
-		m.descCachePath = ""
-		m.descCacheLines = nil
-		return
+// reclampList keeps the list scroll window valid after a cursor move or
+// entries reload — mirrors reclamp from tabelhakanban.
+func (m *tuiModel) reclampList() {
+	// Ensure cursor is in bounds.
+	if m.cursor < 0 {
+		m.cursor = 0
 	}
-	if m.rightInnerWidth <= 0 {
-		return
+	if max := len(m.entries) - 1; m.cursor > max {
+		m.cursor = max
 	}
-	if m.descCachePath == entry.Path && m.descCacheWidth == m.rightInnerWidth {
-		return
+	if max := m.maxListScroll(); m.listScroll > max {
+		m.listScroll = max
 	}
-	m.descCacheLines = renderDescription(entry.WF, m.rightInnerWidth)
-	m.descCachePath = entry.Path
-	m.descCacheWidth = m.rightInnerWidth
-}
-
-// renderDescription renders a workflow's full description: DescriptionFile
-// (markdown, via glamour) when set, falling back to the plain-text
-// Description field — and never failing the panel, since a broken/missing
-// markdown file is not fatal to the rest of the TUI.
-func renderDescription(wf *Workflow, width int) []string {
-	if wf == nil {
-		return []string{theme.Dim().Render("nenhum workflow selecionado")}
+	if m.listScroll < 0 {
+		m.listScroll = 0
 	}
-	if wf.DescriptionFile != "" {
-		path := filepath.Join(workflowsDir(), wf.DescriptionFile)
-		if data, err := os.ReadFile(path); err == nil {
-			if r, err := glamour.NewTermRenderer(
-				glamour.WithStandardStyle("dark"),
-				glamour.WithWordWrap(width),
-			); err == nil {
-				if out, err := r.Render(string(data)); err == nil {
-					return strings.Split(strings.TrimRight(out, "\n"), "\n")
-				}
-			}
-		}
+	// Scroll down if cursor is below visible window.
+	visibleEnd := m.listScroll + m.listRowsHeight
+	if m.cursor >= visibleEnd {
+		m.listScroll = m.cursor - m.listRowsHeight + 1
 	}
-	if wf.Description == "" {
-		return []string{theme.Dim().Render("sem descrição")}
+	// Scroll up if cursor is above visible window.
+	if m.cursor < m.listScroll {
+		m.listScroll = m.cursor
 	}
-	return strings.Split(tuiui.WrapText(wf.Description, width), "\n")
 }
 
 // stepTools returns the distinct tool names used across a workflow's steps,
@@ -675,6 +748,26 @@ func (m tuiModel) renderPanel(content string, availH, w int) string {
 	return theme.Panel(true).Render(content)
 }
 
+// listRenderedLines returns the total number of lines that renderListPanel
+// would produce (workflow entries + group header lines) — used by
+// maxListScroll to compute the scrollable range.
+func (m tuiModel) listRenderedLines() int {
+	count := 0
+	lastGroup := "\x01"
+	for _, e := range m.entries {
+		g := e.Group
+		if g == "" {
+			g = "(sem grupo)"
+		}
+		if g != lastGroup {
+			count++
+			lastGroup = g
+		}
+		count++
+	}
+	return count
+}
+
 func (m tuiModel) renderListPanel() string {
 	title := theme.Title().Render(fmt.Sprintf("workflows (%d)", len(m.entries)))
 	var body string
@@ -695,65 +788,87 @@ func (m tuiModel) renderListPanel() string {
 				lines = append(lines, theme.Muted().Render(g))
 				lastGroup = g
 			}
+			// Scheduled glyph: ● active, ○ inactive
+			glyph := theme.Dim().Render("○")
+			if e.Scheduled {
+				glyph = theme.Success().Render("●")
+			}
 			if i == m.cursor {
-				lines = append(lines, theme.Title().Render("▸ "+e.Name))
+				lines = append(lines, theme.Title().Render("▸ "+glyph+" "+e.Name))
 			} else {
-				lines = append(lines, "  "+e.Name)
+				lines = append(lines, "  "+glyph+" "+e.Name)
 			}
 		}
-		body = strings.Join(lines, "\n")
+		// Clip to visible window (list scroll).
+		scroll := m.listScroll
+		if scroll > len(lines) {
+			scroll = len(lines)
+		}
+		end := scroll + m.listRowsHeight
+		if end > len(lines) {
+			end = len(lines)
+		}
+		body = strings.Join(lines[scroll:end], "\n")
 	}
 	content := title + "\n" + tuiui.PadToHeight(body, m.listRowsHeight)
 	content = tuiui.PadLines(content, m.listInnerWidth)
 	return theme.Panel(m.focus == focusList).Render(content)
 }
 
+// computeMetaContent builds the metadata panel lines for a workflow.
+func computeMetaContent(entry *workflowEntry) []string {
+	if entry == nil || entry.WF == nil {
+		return []string{theme.Dim().Render("nenhum workflow selecionado")}
+	}
+	wf := entry.WF
+	creator := wf.Metadata.Creator
+	if creator == "" {
+		creator = "-"
+	}
+	installedAt := wf.Metadata.InstalledAt
+	if installedAt == "" {
+		installedAt = "-"
+	}
+	updatedAt := wf.Metadata.UpdatedAt
+	if updatedAt == "" {
+		updatedAt = "-"
+	}
+	scheduleStr := "-"
+	if wf.Schedule.Kind != "" {
+		scheduleStr = scheduleString(wf.Schedule)
+	} else if wf.Schedule.OnCalendar != "" {
+		scheduleStr = wf.Schedule.OnCalendar
+	}
+	scheduleStatus := theme.Muted().Render("agendamento: inativo")
+	if entry.Scheduled {
+		scheduleStatus = theme.Success().Render("agendamento: ativo")
+	}
+	tools := stepTools(wf.Steps)
+	toolsLine := "tools: " + strings.Join(tools, ", ")
+	if len(tools) == 0 {
+		toolsLine = "tools: -"
+	}
+	group := entry.Group
+	if group == "" {
+		group = "-"
+	}
+	return []string{
+		"criador: " + creator,
+		"instalado em: " + installedAt,
+		"atualizado em: " + updatedAt,
+		"grupo: " + group,
+		scheduleStatus,
+		"schedule: " + scheduleStr,
+		"",
+		toolsLine,
+	}
+}
+
 func (m tuiModel) renderMetaPanel() string {
 	title := theme.Title().Render("metadados")
 	entry := m.current()
-	var body string
-	if entry == nil || entry.WF == nil {
-		body = theme.Dim().Render("nenhum workflow selecionado")
-	} else {
-		wf := entry.WF
-		creator := wf.Metadata.Creator
-		if creator == "" {
-			creator = "-"
-		}
-		installedAt := wf.Metadata.InstalledAt
-		if installedAt == "" {
-			installedAt = "-"
-		}
-		onCalendar := wf.Schedule.OnCalendar
-		if onCalendar == "" && wf.Schedule.Kind != "" {
-			onCalendar = scheduleString(wf.Schedule)
-		}
-		if onCalendar == "" {
-			onCalendar = "-"
-		}
-		scheduleStatus := theme.Muted().Render("agendamento: inativo")
-		if IsScheduled(entry.File) {
-			scheduleStatus = theme.Success().Render("agendamento: ativo")
-		}
-		tools := stepTools(wf.Steps)
-		toolsLine := "tools: " + strings.Join(tools, ", ")
-		if len(tools) == 0 {
-			toolsLine = "tools: -"
-		}
-		group := entry.Group
-		if group == "" {
-			group = "-"
-		}
-		body = strings.Join([]string{
-			"criador: " + creator,
-			"instalado em: " + installedAt,
-			"grupo: " + group,
-			scheduleStatus,
-			"on_calendar: " + onCalendar,
-			"",
-			toolsLine,
-		}, "\n")
-	}
+	body := strings.Join(computeMetaContent(entry), "\n")
+	body = tuiui.WrapText(body, m.rightInnerWidth)
 	content := title + "\n" + tuiui.PadToHeight(body, m.metaLines)
 	content = tuiui.PadLines(content, m.rightInnerWidth)
 	return theme.Panel(false).Render(content)
@@ -761,41 +876,40 @@ func (m tuiModel) renderMetaPanel() string {
 
 func (m tuiModel) renderDescPanel() string {
 	entry := m.current()
-	title := "descrição"
-	var body string
-	switch {
-	case entry == nil || entry.WF == nil:
-		body = theme.Dim().Render("nenhum workflow selecionado")
-	default:
-		lines := m.descCacheLines
-		if total := len(lines); total > m.descMaxLines {
-			title = fmt.Sprintf("descrição (%d–%d/%d)", m.descScroll+1, min(m.descScroll+m.descMaxLines, total), total)
-		}
-		body = m.renderDescBody(lines)
-	}
-	content := theme.Title().Render(title) + "\n" + tuiui.PadToHeight(body, m.descMaxLines)
-	content = tuiui.PadLines(content, m.rightInnerWidth)
-	return theme.Panel(m.focus == focusDesc).Render(content)
-}
+	m.descVP.Focus(m.focus == focusDesc)
 
-// renderDescBody clips lines to the panel's fixed descMaxLines budget,
-// starting at descScroll — this is what keeps the description panel's
-// rendered height constant regardless of content length.
-func (m tuiModel) renderDescBody(lines []string) string {
-	scroll := m.descScroll
-	if max := m.maxDescScroll(); scroll > max {
-		scroll = max
+	if entry == nil || entry.WF == nil {
+		m.descVP.SetTitle("descrição")
+		m.descVP.SetMarkdown("", m.rightInnerWidth, theme)
+		return m.descVP.View(theme, m.rightInnerWidth+4)
 	}
-	end := scroll + m.descMaxLines
-	if end > len(lines) {
-		end = len(lines)
+
+	// Build the markdown body: DescriptionFile (markdown) takes precedence.
+	var body string
+	if entry.WF.DescriptionFile != "" {
+		path := filepath.Join(workflowsDir(), entry.WF.DescriptionFile)
+		if data, err := os.ReadFile(path); err == nil {
+			body = string(data)
+		}
 	}
-	return strings.Join(lines[scroll:end], "\n")
+	if body == "" {
+		body = entry.WF.Description
+	}
+	if body == "" {
+		body = theme.Dim().Render("sem descrição")
+	}
+
+	m.descVP.SetTitle(entry.WF.Name)
+	m.descVP.SetMarkdown(body, m.rightInnerWidth, theme)
+	return m.descVP.View(theme, m.rightInnerWidth+4)
 }
 
 func (m tuiModel) View() string {
 	if m.width == 0 {
 		return "carregando..."
+	}
+	if m.settingsModal.Visible() {
+		return m.settingsModal.View(theme)
 	}
 	if m.helpModal.Visible() {
 		return m.helpModal.View(theme)
@@ -803,7 +917,26 @@ func (m tuiModel) View() string {
 	if m.mode == modeRun {
 		return m.viewRun()
 	}
+	if m.scheduleForm != nil {
+		return m.viewScheduleForm()
+	}
 	return m.viewList()
+}
+
+// viewScheduleForm renders the huh schedule form as a centered modal
+// overlay. Without this, the form processes input but never renders —
+// the TUI looks frozen because the user can't see the form.
+func (m tuiModel) viewScheduleForm() string {
+	w, h := m.width, m.height
+	if w <= 0 {
+		w = 80
+	}
+	if h <= 0 {
+		h = 24
+	}
+	body := m.scheduleForm.View()
+	box := theme.Modal().Render(body)
+	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, box)
 }
 
 func (m tuiModel) viewList() string {
@@ -817,11 +950,23 @@ func (m tuiModel) viewList() string {
 	rightCol := lipgloss.JoinVertical(lipgloss.Left, metaBox, descBox)
 	body := lipgloss.JoinHorizontal(lipgloss.Top, listBox, strings.Repeat(" ", panelGap), rightCol)
 
+	scheduledCount := 0
+	for _, e := range m.entries {
+		if e.Scheduled {
+			scheduledCount++
+		}
+	}
 	status := fmt.Sprintf("%d workflows", len(m.entries))
-	if m.scheduleStatus != "" {
+	if scheduledCount > 0 {
+		status += fmt.Sprintf(" · %d agendados", scheduledCount)
+	}
+	// Transient notice takes priority over the count.
+	if m.noticeMsg != "" {
+		status = m.noticeMsg
+	} else if m.scheduleStatus != "" {
 		status = m.scheduleStatus
 	}
-	footer := tuiui.NewFooter(bindingsOf("nav", "scroll", "run", "toggle-schedule", "help", "quit")...).
+	footer := tuiui.NewFooter(bindingsOf("nav", "scroll", "run", "toggle-schedule", "refresh", "help", "quit")...).
 		Status(status).
 		Render(w, theme)
 

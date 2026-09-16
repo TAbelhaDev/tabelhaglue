@@ -112,7 +112,7 @@ args = { name = "${steps.0.output.0.name}" }
 
 ## Scheduling
 
-`taglue enable <workflow>` creates systemd user timer units (`~/.config/systemd/user/taglue-<name>.{timer,service}`). The workflow's `[schedule].on_calendar` field sets the `OnCalendar` expression.
+`taglue enable <workflow>` creates systemd user timer units following the tajobs convention (`~/.config/systemd/user/<name>.{timer,service}`). A wrapper script is written to `~/jobs/<name>/<name>.sh` and logs to `~/jobs/<name>/<name>.log`, so scheduled workflows also appear in [jobs-tui](https://github.com/TAbelhaDev/tajobs).
 
 The schedule uses `Persistent=yes`, so a missed run fires when the machine wakes up. Timer state is derived from the `.timer` file existence (same convention as [tabelhajobs](https://github.com/TAbelhaDev/tabelhajobs)).
 

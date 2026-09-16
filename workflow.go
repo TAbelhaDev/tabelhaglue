@@ -22,10 +22,13 @@ type Workflow struct {
 }
 
 // Metadata records who installed a workflow and when — display-only, shown
-// in the TUI's metadata panel.
+// in the TUI's metadata panel. UpdatedAt is auto-maintained via the
+// metadata.toml sidecar (installed_at on first schedule, updated_at on
+// every change).
 type Metadata struct {
 	Creator     string `toml:"creator"`
 	InstalledAt string `toml:"installed_at"` // RFC3339
+	UpdatedAt   string `toml:"updated_at"`   // RFC3339
 }
 
 // Schedule holds the systemd OnCalendar expression for a workflow. Whether
@@ -57,23 +60,42 @@ type Step struct {
 	TimeoutSeconds *int              `toml:"timeout_seconds"`
 }
 
-// loadWorkflow reads a workflow TOML file and merges any sidecar schedule.
+// loadWorkflow reads a workflow TOML file and merges any sidecar schedule
+// and metadata. Sidecar metadata overrides installed_at/updated_at/creator
+// when present (sidecar is authoritative for auto-managed fields).
 func loadWorkflow(path string) (*Workflow, error) {
 	var w Workflow
 	_, err := toml.DecodeFile(path, &w)
 	if err != nil {
 		return nil, err
 	}
+	file := strings.TrimSuffix(filepath.Base(path), ".toml")
+
 	// Merge sidecar if no raw on_calendar and no structured kind in TOML
 	if w.Schedule.OnCalendar == "" && w.Schedule.Kind == "" {
 		sidecar, err := loadSchedules()
 		if err == nil {
-			file := strings.TrimSuffix(filepath.Base(path), ".toml")
 			if s, ok := sidecar[file]; ok {
 				w.Schedule = s
 			}
 		}
 	}
+
+	// Merge metadata sidecar: sidecar wins for installed_at/updated_at/creator
+	if meta, err := loadMetadata(); err == nil {
+		if m, ok := meta[file]; ok {
+			if m.Creator != "" {
+				w.Metadata.Creator = m.Creator
+			}
+			if m.InstalledAt != "" {
+				w.Metadata.InstalledAt = m.InstalledAt
+			}
+			if m.UpdatedAt != "" {
+				w.Metadata.UpdatedAt = m.UpdatedAt
+			}
+		}
+	}
+
 	return &w, nil
 }
 
@@ -111,6 +133,9 @@ type workflowEntry struct {
 	// Group is the named project group this workflow belongs to
 	// (mirroring radar's [[groups]] config). Empty means ungrouped.
 	Group string
+	// Scheduled is true when a systemd timer unit exists for this workflow.
+	// Cached at list load + refresh to avoid os.Stat per render frame.
+	Scheduled bool
 	// WF is the fully parsed workflow, kept around so the TUI's metadata and
 	// description panels don't need to re-read the TOML on every render.
 	WF *Workflow
@@ -141,7 +166,7 @@ func listWorkflowEntries() ([]workflowEntry, error) {
 		if name == "" {
 			name = file
 		}
-		entries = append(entries, workflowEntry{Name: name, Description: w.Description, Path: path, File: file, Group: w.Group, WF: w})
+		entries = append(entries, workflowEntry{Name: name, Description: w.Description, Path: path, File: file, Group: w.Group, Scheduled: IsScheduled(file), WF: w})
 	}
 	sort.Slice(entries, func(i, j int) bool {
 		gi, gj := entries[i].Group, entries[j].Group

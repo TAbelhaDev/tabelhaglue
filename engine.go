@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -129,12 +130,45 @@ func engine(w *Workflow) error {
 	}
 
 	if last != nil {
-		var pretty bytes.Buffer
-		json.Indent(&pretty, last, "", "  ")
-		fmt.Println(pretty.String())
+		compactPrint(os.Stdout, last)
 	}
 
 	return nil
+}
+
+// compactPrint outputs a condensed summary for large arrays (count + titles)
+// and pretty-prints everything else.
+func compactPrint(w io.Writer, data []byte) {
+	var arr []map[string]any
+	if err := json.Unmarshal(data, &arr); err != nil || len(arr) == 0 {
+		// Not an array or empty — pretty-print the raw value.
+		var pretty bytes.Buffer
+		if json.Indent(&pretty, data, "", "  ") == nil {
+			pretty.WriteTo(w)
+		} else {
+			fmt.Fprintln(w, string(data))
+		}
+		return
+	}
+	// Array: print count + each item's title (or first 80 chars).
+	fmt.Fprintf(w, "%d item(s)\n", len(arr))
+	for _, item := range arr {
+		title, _ := item["title"].(string)
+		if title == "" {
+			if name, ok := item["name"].(string); ok {
+				title = name
+			}
+		}
+		if title == "" {
+			// Fallback: first 80 chars of the item.
+			raw, _ := json.Marshal(item)
+			if len(raw) > 80 {
+				raw = raw[:80]
+			}
+			title = string(raw)
+		}
+		fmt.Fprintf(w, "  - %s\n", title)
+	}
 }
 
 // interpolateArgs replaces ${steps.N.output.field} references in args.
@@ -178,6 +212,9 @@ func extractField(data json.RawMessage, field string) string {
 		switch v := current.(type) {
 		case map[string]any:
 			current = v[p]
+			if current == nil {
+				return string(data)
+			}
 		default:
 			return fmt.Sprintf("%v", current)
 		}

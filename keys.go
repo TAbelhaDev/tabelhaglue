@@ -24,6 +24,8 @@ func init() {
 		// Same "nav" convention as tabelharadar/tabelhajobs/tabelhanet.
 		tuiui.Action{ID: "nav", Help: "move focus", Keys: []string{"ctrl+h", "ctrl+l"}, Label: "ctrl+h/l"},
 		tuiui.Action{ID: "toggle-schedule", Help: "ativar/desativar agendamento", Keys: []string{"e"}},
+		tuiui.Action{ID: "refresh", Help: "recarregar workflows", Keys: []string{"ctrl+r"}},
+		tuiui.Action{ID: "settings", Help: "rebind teclas", Keys: []string{","}},
 	)
 }
 

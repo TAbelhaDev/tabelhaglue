@@ -247,8 +247,9 @@ func TestExtractField_Nested(t *testing.T) {
 func TestExtractField_Missing(t *testing.T) {
 	data := json.RawMessage(`{"name": "test"}`)
 	got := extractField(data, "missing")
-	// Missing field in non-map falls through to raw
-	if got == "" {
-		t.Error("extractField(missing) returned empty string")
+	// Missing field in object → raw JSON fallback (README:111).
+	want := `{"name": "test"}`
+	if got != want {
+		t.Errorf("extractField(missing) = %q, want %q", got, want)
 	}
 }
