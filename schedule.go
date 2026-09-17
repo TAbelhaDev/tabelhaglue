@@ -214,6 +214,11 @@ func DisableWorkflow(name string) error {
 	os.Remove(scriptPath(name))
 	os.Remove(filepath.Join(jobsDir(name), name+".recur"))
 
+	// Clear the schedules.toml sidecar entry too — otherwise a workflow
+	// disabled via this path (e.g. the TUI's `e` toggle) keeps looking
+	// "scheduled" in the sidecar even though its timer is gone.
+	_ = removeSchedule(name)
+
 	if out, err := exec.Command("systemctl", "--user", "daemon-reload").CombinedOutput(); err != nil {
 		return fmt.Errorf("erro em daemon-reload: %s", string(out))
 	}
