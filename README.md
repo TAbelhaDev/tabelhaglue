@@ -5,7 +5,7 @@ Workflow engine for the TAbelha ecosystem. Runs declarative pipelines of IPC cal
 ## Install
 
 ```bash
-go install github.com/TAbelhaDev/tabelhaglue@latest
+go install github.com/TAbelhaDev/tabelhaglue/cmd/taglue@latest
 ```
 
 ## Usage
@@ -119,3 +119,14 @@ The schedule uses `Persistent=yes`, so a missed run fires when the machine wakes
 ## IPC convention
 
 All tools must implement `<tool> ipc <method> --json [key=value...]` and print JSON to stdout.
+
+## Local development
+
+A `post-commit` hook in `.githooks/` rebuilds and reinstalls `taglue` to
+`~/.local/bin/taglue` after every commit, so the local command never goes
+stale. Git doesn't enable a repo's `.githooks/` automatically on clone — run
+this once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```

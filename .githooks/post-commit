@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Rebuilds and reinstalls the taglue binary to ~/.local/bin after every
+# commit, so the local command never goes stale waiting for someone to
+# remember to rebuild it after a release.
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+target="$HOME/.local/bin/taglue"
+
+if go build -o "$target" "$repo_root/cmd/taglue"; then
+	echo "post-commit: reinstalled $target"
+else
+	echo "post-commit: WARNING - failed to rebuild $target (repo still builds fine, this is just the local install)" >&2
+fi
