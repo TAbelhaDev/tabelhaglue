@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
 )
@@ -173,7 +172,7 @@ func TestInterpolateArgs_Multiple(t *testing.T) {
 	}
 }
 
-func TestListWorkflowEntries_GroupSort(t *testing.T) {
+func TestSortWorkflowEntries_GroupSort(t *testing.T) {
 	// Test that group-aware sorting puts ungrouped last
 	entries := []workflowEntry{
 		{Name: "gamma", Group: ""},
@@ -182,25 +181,31 @@ func TestListWorkflowEntries_GroupSort(t *testing.T) {
 		{Name: "delta", Group: "tabeladev"},
 	}
 
-	// Sort using same logic as listWorkflowEntries
-	sort.Slice(entries, func(i, j int) bool {
-		gi, gj := entries[i].Group, entries[j].Group
-		if gi == "" && gj == "" {
-			return entries[i].Name < entries[j].Name
-		}
-		if gi == "" {
-			return false
-		}
-		if gj == "" {
-			return true
-		}
-		if gi != gj {
-			return gi < gj
-		}
-		return entries[i].Name < entries[j].Name
-	})
+	sortWorkflowEntries(entries)
+
 	// Expected: tabeladev(beta,delta), wiv(alpha), ungrouped(gamma)
 	expected := []string{"beta", "delta", "alpha", "gamma"}
+	for i, e := range entries {
+		if e.Name != expected[i] {
+			t.Errorf("entries[%d].Name = %q, want %q", i, e.Name, expected[i])
+		}
+	}
+}
+
+func TestSortWorkflowEntries_ScheduledFirst(t *testing.T) {
+	// Scheduled entries must sort before unscheduled ones, ahead of group/name.
+	entries := []workflowEntry{
+		{Name: "delta", Group: "tabeladev", Scheduled: false},
+		{Name: "alpha", Group: "wiv", Scheduled: true},
+		{Name: "gamma", Group: "", Scheduled: false},
+		{Name: "beta", Group: "tabeladev", Scheduled: true},
+	}
+
+	sortWorkflowEntries(entries)
+
+	// Expected: scheduled first (tabeladev/beta, wiv/alpha), then unscheduled
+	// (tabeladev/delta, ungrouped/gamma).
+	expected := []string{"beta", "alpha", "delta", "gamma"}
 	for i, e := range entries {
 		if e.Name != expected[i] {
 			t.Errorf("entries[%d].Name = %q, want %q", i, e.Name, expected[i])

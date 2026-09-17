@@ -168,7 +168,20 @@ func listWorkflowEntries() ([]workflowEntry, error) {
 		}
 		entries = append(entries, workflowEntry{Name: name, Description: w.Description, Path: path, File: file, Group: w.Group, Scheduled: IsScheduled(file), WF: w})
 	}
+	sortWorkflowEntries(entries)
+	return entries, nil
+}
+
+// sortWorkflowEntries orders entries in place: scheduled (ativos) first, then
+// group, then name. Callers that mutate an entry's Scheduled field after the
+// initial load (e.g. toggling a schedule in the TUI) must call this again to
+// keep the list grouped correctly.
+func sortWorkflowEntries(entries []workflowEntry) {
 	sort.Slice(entries, func(i, j int) bool {
+		si, sj := entries[i].Scheduled, entries[j].Scheduled
+		if si != sj {
+			return si
+		}
 		gi, gj := entries[i].Group, entries[j].Group
 		// Empty group sorts last
 		if gi == "" && gj == "" {
@@ -185,5 +198,4 @@ func listWorkflowEntries() ([]workflowEntry, error) {
 		}
 		return entries[i].Name < entries[j].Name
 	})
-	return entries, nil
 }

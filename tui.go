@@ -295,6 +295,7 @@ func (m tuiModel) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 					break
 				}
 			}
+			sortWorkflowEntries(m.entries)
 		default:
 			m.noticeMsg = fmt.Sprintf("%q agendamento removido", msg.name)
 			m.noticeClearAt = time.Now().Add(4 * time.Second)
@@ -304,6 +305,7 @@ func (m tuiModel) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 					break
 				}
 			}
+			sortWorkflowEntries(m.entries)
 		}
 		m.scheduleStatus = ""
 		return m, clearNoticeCmd()
@@ -749,19 +751,19 @@ func (m tuiModel) renderPanel(content string, availH, w int) string {
 }
 
 // listRenderedLines returns the total number of lines that renderListPanel
-// would produce (workflow entries + group header lines) — used by
+// would produce (section headers + workflow entries) — used by
 // maxListScroll to compute the scrollable range.
 func (m tuiModel) listRenderedLines() int {
-	count := 0
-	lastGroup := "\x01"
+	if len(m.entries) == 0 {
+		return 0
+	}
+	// One section header per status transition (ativos → inativos).
+	count := 1 // first section header
+	lastScheduled := m.entries[0].Scheduled
 	for _, e := range m.entries {
-		g := e.Group
-		if g == "" {
-			g = "(sem grupo)"
-		}
-		if g != lastGroup {
+		if e.Scheduled != lastScheduled {
 			count++
-			lastGroup = g
+			lastScheduled = e.Scheduled
 		}
 		count++
 	}
@@ -777,18 +779,27 @@ func (m tuiModel) renderListPanel() string {
 	case len(m.entries) == 0:
 		body = theme.Muted().Render("nenhum workflow em " + workflowsDir())
 	default:
+		// Count per-section for header labels.
+		var scheduled, unscheduled int
+		for _, e := range m.entries {
+			if e.Scheduled {
+				scheduled++
+			} else {
+				unscheduled++
+			}
+		}
 		lines := make([]string, 0, len(m.entries))
-		lastGroup := "\x01" // impossible value
+		var lastScheduled *bool // nil forces header on first entry
 		for i, e := range m.entries {
-			g := e.Group
-			if g == "" {
-				g = "(sem grupo)"
+			if lastScheduled == nil || e.Scheduled != *lastScheduled {
+				s := e.Scheduled
+				lastScheduled = &s
+				if e.Scheduled {
+					lines = append(lines, theme.Success().Render(fmt.Sprintf("ativos (%d)", scheduled)))
+				} else {
+					lines = append(lines, theme.Muted().Render(fmt.Sprintf("inativos (%d)", unscheduled)))
+				}
 			}
-			if g != lastGroup {
-				lines = append(lines, theme.Muted().Render(g))
-				lastGroup = g
-			}
-			// Scheduled glyph: ● active, ○ inactive
 			glyph := theme.Dim().Render("○")
 			if e.Scheduled {
 				glyph = theme.Success().Render("●")
